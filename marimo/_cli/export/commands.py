@@ -21,6 +21,7 @@ from marimo._server.export import (
     export_as_wasm,
     run_app_then_export_as_html,
     run_app_then_export_as_ipynb,
+    run_app_then_export_as_md_output,
 )
 from marimo._server.export.exporter import Exporter
 from marimo._server.utils import asyncio_run
@@ -635,3 +636,101 @@ export.add_command(script)
 export.add_command(md)
 export.add_command(ipynb)
 export.add_command(html_wasm)
+
+
+@click.command(
+    help="""
+Export executed outputs to pure Markdown with assets.
+
+Example:
+
+    marimo export md-output notebook.py -o out_dir
+
+The command runs the notebook, captures outputs, and writes:
+- index.md with pure Markdown (no styling)
+- assets/ folder for images/videos/specs referenced from the Markdown
+"""
+)
+@click.option(
+    "--watch/--no-watch",
+    default=False,
+    show_default=True,
+    type=bool,
+    help=_watch_message,
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Output directory containing index.md and assets/",
+)
+@click.option(
+    "--sandbox/--no-sandbox",
+    is_flag=True,
+    default=None,
+    show_default=False,
+    type=bool,
+    help=_sandbox_message,
+)
+@click.option(
+    "-f",
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Force overwrite of index.md if it already exists.",
+)
+@click.argument(
+    "name",
+    required=True,
+    type=click.Path(exists=True, file_okay=True, dir_okay=False),
+)
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+def md_output(
+    name: str,
+    output: Path,
+    watch: bool,
+    sandbox: Optional[bool],
+    force: bool,
+    args: tuple[str],
+) -> None:
+    """Run a notebook and export outputs as pure Markdown + assets."""
+    import sys
+
+    # Set default, if not provided
+    if sandbox is None:
+        from marimo._cli.sandbox import maybe_prompt_run_in_sandbox
+
+        sandbox = maybe_prompt_run_in_sandbox(name)
+
+    if sandbox:
+        from marimo._cli.sandbox import run_in_sandbox
+
+        run_in_sandbox(sys.argv[1:], name=name)
+        return
+
+    out_dir = Path(output)
+    # Ensure directory exists so watch write works
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cli_args = parse_args(args)
+
+    def export_callback(file_path: MarimoPath) -> ExportResult:
+        result = asyncio_run(
+            run_app_then_export_as_md_output(
+                file_path,
+                out_dir,
+                cli_args=cli_args,
+                argv=list(args),
+            )
+        )
+        return result
+
+    # Use the provided notebook name to determine the output file name
+    outfile = Path(out_dir) / Path(name).with_suffix(".md").name
+    return watch_and_export(
+        MarimoPath(name), outfile, watch, export_callback, force
+    )
+
+
+export.add_command(md_output)

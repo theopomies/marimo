@@ -818,6 +818,116 @@ class TestExportMarkdown:
                 break
 
 
+class TestExportMdOutput:
+    @staticmethod
+    def test_export_md_output_basic(temp_marimo_file: str) -> None:
+        out_dir = Path(temp_marimo_file).parent / "mdout"
+        p = subprocess.run(
+            [
+                "marimo",
+                "export",
+                "md-output",
+                temp_marimo_file,
+                "--output",
+                str(out_dir),
+            ],
+            capture_output=True,
+        )
+        assert p.returncode == 0, p.stderr.decode()
+        assert (out_dir / "index.md").exists()
+        # assets folder should exist even if empty
+        assert (out_dir / "assets").exists()
+        body = (out_dir / "index.md").read_text(encoding="utf-8")
+        # No marimo editor components in output
+        assert "marimo-code-editor" not in body
+        # No empty code fences
+        assert "```\n\n```" not in body
+        # Body may be empty for notebooks without non-interactive outputs
+
+    @staticmethod
+    @pytest.mark.skipif(
+        not DependencyManager.matplotlib.has(),
+        reason="This test requires matplotlib.",
+    )
+    def test_export_md_output_matplotlib_assets(
+        tmp_path: pathlib.Path,
+    ) -> None:
+        # Create a small notebook that renders a matplotlib figure
+        nb = tmp_path / "mpl.py"
+        nb.write_text(
+            """
+import marimo as mo
+import marimo
+app = marimo.App()
+
+@app.cell
+def _():
+    import matplotlib.pyplot as plt
+    plt.plot([0,1,2],[0,1,0])
+    plt.show()
+    return ()
+
+if __name__ == "__main__":
+    app.run()
+            """
+        )
+        out_dir = tmp_path / "mdout"
+        p = subprocess.run(
+            [
+                "marimo",
+                "export",
+                "md-output",
+                str(nb),
+                "--output",
+                str(out_dir),
+            ],
+            capture_output=True,
+        )
+        assert p.returncode == 0, p.stderr.decode()
+        body = (out_dir / "index.md").read_text(encoding="utf-8")
+        # A referenced image should be present
+        assert "![](assets/" in body
+        # An asset file should be saved
+        assets = list((out_dir / "assets").glob("*"))
+        assert len(assets) >= 1
+
+    @staticmethod
+    @pytest.mark.skipif(
+        condition=DependencyManager.watchdog.has() or _is_win32(),
+        reason="hangs when watchdog is installed, flaky on Windows",
+    )
+    def test_export_md_output_watch(temp_marimo_file: str) -> None:
+        out_dir = Path(temp_marimo_file).parent / "mdout-watch"
+        p = subprocess.Popen(
+            [
+                "marimo",
+                "export",
+                "md-output",
+                temp_marimo_file,
+                "--output",
+                str(out_dir),
+                "--watch",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Wait for the message
+        while True:
+            line = p.stdout.readline().decode()
+            if line:
+                if "Watching " in line:
+                    break
+        # Modify file to trigger
+        with open(temp_marimo_file, "a") as f:
+            f.write("\n# trigger\n")
+        # Wait for regeneration
+        while True:
+            line = p.stdout.readline().decode()
+            if line and "Re-exporting" in line:
+                break
+        assert (out_dir / "index.md").exists()
+
+
 class TestExportIpynb:
     @pytest.mark.skipif(
         not DependencyManager.nbformat.has(),

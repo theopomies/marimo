@@ -4,8 +4,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import mimetypes
+import re
 from concurrent.futures import ThreadPoolExecutor
+from html import unescape
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -235,6 +238,433 @@ class Exporter:
         stream.seek(0)
         download_filename = get_download_filename(filename, "ipynb")
         return stream.read(), download_filename
+
+    def export_as_md_output(
+        self,
+        *,
+        filename: Optional[str],
+        app: InternalApp,
+        session_view: SessionView,
+        output_directory: Path,
+    ) -> tuple[str, str]:
+        """Export executed outputs as pure Markdown with assets.
+
+        - No inline HTML except iframe/video when unavoidable
+        - Interactive elements are represented as HTML comments
+        - Assets saved under an assets/ folder and referenced from Markdown
+        - Code is excluded except when a cell uses mo.show_code(...)
+        """
+
+        filename = get_filename(filename)
+        assets_dir = Path(output_directory) / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+
+        # Helper to create unique asset filenames
+        def save_binary_asset(
+            data_bytes: bytes, ext: str, *, cell_index: int, asset_index: int
+        ) -> str:
+            safe_ext = ext if ext.startswith(".") else f".{ext}"
+            name = f"cell-{cell_index:03d}-{asset_index:02d}{safe_ext}"
+            target = assets_dir / name
+            target.write_bytes(data_bytes)
+            return f"assets/{name}"
+
+        def save_text_asset(
+            data_text: str, ext: str, *, cell_index: int, asset_index: int
+        ) -> str:
+            safe_ext = ext if ext.startswith(".") else f".{ext}"
+            name = f"cell-{cell_index:03d}-{asset_index:02d}{safe_ext}"
+            target = assets_dir / name
+            target.write_text(data_text, encoding="utf-8")
+            return f"assets/{name}"
+
+        def decode_data_uri(data: str) -> tuple[str, bytes] | None:
+            """Decode a data URI string -> (mime, bytes)."""
+            try:
+                if not data.startswith("data:"):
+                    return None
+                header, base64_part = data.split(",", 1)
+                mime = header.split(";")[0][5:]
+                if ";base64" in header:
+                    return mime, base64.b64decode(base64_part)
+                # Not base64; treat as plain bytes
+                return mime, base64_part.encode("utf-8")
+            except Exception:
+                return None
+
+        def try_decode_base64(data_str: str) -> bytes | None:
+            """Best-effort base64 decode for strings not in data URI form."""
+            try:
+                compact = re.sub(r"\s+", "", data_str)
+                return base64.b64decode(compact, validate=False)
+            except Exception:
+                return None
+
+        # Choose the best mime for Markdown rendering from a mimebundle
+        def choose_mime_for_markdown(
+            bundle: dict[str, Any],
+        ) -> tuple[str, Any]:
+            preference: list[str] = [
+                "text/markdown",
+                "image/png",
+                "image/jpeg",
+                "image/gif",
+                "image/svg+xml",
+                "text/plain",
+                "text/csv",
+                "application/json",
+                "video/mp4",
+                "video/mpeg",
+                "text/html",
+            ]
+            for mime in preference:
+                if mime in bundle:
+                    return mime, bundle[mime]
+            # Fallback to first
+            if bundle:
+                mime, content = next(iter(bundle.items()))
+                return mime, content
+            return "text/plain", ""
+
+        # Convert one CellOutput to Markdown lines, saving any assets
+        def output_to_markdown(
+            output: CellOutput, *, cell_index: int
+        ) -> list[str]:
+            lines: list[str] = []
+            nonlocal_asset_index = 0
+
+            def next_asset_index() -> int:
+                nonlocal nonlocal_asset_index
+                nonlocal_asset_index += 1
+                return nonlocal_asset_index
+
+            mimetype: KnownMimeType = output.mimetype
+            data: Any = output.data
+
+            # Normalize mimebundle
+            if mimetype == "application/vnd.marimo+mimebundle":
+                mimetype, data = choose_mime_for_markdown(
+                    cast(dict[str, Any], data)
+                )
+
+            # Ignore explicit marimo error types here; console carries traceback
+            if mimetype == "application/vnd.marimo+error":
+                return lines
+
+            # Images
+            if mimetype.startswith("image/"):
+                # Data may be a data URI, base64, raw SVG, or raw bytes
+                if isinstance(data, str):
+                    decoded = decode_data_uri(data)
+                    if decoded is not None:
+                        mime, bytes_ = decoded
+                        ext = mimetypes.guess_extension(mime) or ".bin"
+                        rel = save_binary_asset(
+                            bytes_,
+                            ext,
+                            cell_index=cell_index,
+                            asset_index=next_asset_index(),
+                        )
+                        lines.append(f"![]({rel})")
+                        lines.append("")
+                        return lines
+                    # SVG textual content
+                    if mimetype == "image/svg+xml":
+                        rel = save_text_asset(
+                            data,
+                            ".svg",
+                            cell_index=cell_index,
+                            asset_index=next_asset_index(),
+                        )
+                        lines.append(f"![]({rel})")
+                        lines.append("")
+                        return lines
+                    # Attempt base64 decode of non-data-URI string
+                    maybe = try_decode_base64(data)
+                    if maybe is not None:
+                        ext = mimetypes.guess_extension(mimetype) or ".bin"
+                        rel = save_binary_asset(
+                            maybe,
+                            ext,
+                            cell_index=cell_index,
+                            asset_index=next_asset_index(),
+                        )
+                        lines.append(f"![]({rel})")
+                        lines.append("")
+                        return lines
+                elif isinstance(data, (bytes, bytearray)):
+                    ext = mimetypes.guess_extension(mimetype) or ".bin"
+                    rel = save_binary_asset(
+                        bytes(data),
+                        ext,
+                        cell_index=cell_index,
+                        asset_index=next_asset_index(),
+                    )
+                    lines.append(f"![]({rel})")
+                    lines.append("")
+                    return lines
+                # Unknown image format representation
+                return lines
+
+            # Video
+            if mimetype.startswith("video/"):
+                if isinstance(data, str):
+                    decoded = decode_data_uri(data)
+                    if decoded is not None:
+                        mime, bytes_ = decoded
+                        ext = mimetypes.guess_extension(mime) or ".mp4"
+                        rel = save_binary_asset(
+                            bytes_,
+                            ext,
+                            cell_index=cell_index,
+                            asset_index=next_asset_index(),
+                        )
+                        lines.append(f'<video controls src="{rel}"></video>')
+                        lines.append("")
+                        return lines
+                # If not a data URI, skip
+                return lines
+
+            # Markdown
+            if mimetype == "text/markdown":
+                if isinstance(data, str):
+                    text = data.strip()
+                    if text:
+                        lines.append(text)
+                        lines.append("")
+                return lines
+
+            # Plain text -> fenced code block
+            if mimetype == "text/plain":
+                text = str(data)
+                stripped = text.strip("\n")
+                if stripped.strip() != "":
+                    lines.extend(["```", stripped, "```", ""])
+                return lines
+
+            # CSV -> save asset and link
+            if mimetype == "text/csv":
+                csv_text = str(data)
+                rel = save_text_asset(
+                    csv_text,
+                    ".csv",
+                    cell_index=cell_index,
+                    asset_index=next_asset_index(),
+                )
+                lines.append(f"[Download CSV]({rel})")
+                lines.append("")
+                return lines
+
+            # JSON -> fenced code block json
+            if mimetype == "application/json":
+                try:
+                    json_text = (
+                        json.dumps(data, indent=2)
+                        if not isinstance(data, str)
+                        else data
+                    )
+                except Exception:
+                    json_text = str(data)
+                if json_text.strip() != "":
+                    lines.extend(
+                        ["```json", json_text.rstrip("\n"), "```", ""]
+                    )
+                return lines
+
+            # HTML -> allow iframe/video, otherwise strip tags or comment if interactive
+            if mimetype == "text/html":
+                raw_html_str = str(data)
+                html_str = unescape(raw_html_str)
+                # If contains marimo web components, include comment placeholder
+                comp_match = re.search(r"<\s*(marimo-[a-z0-9\-]+)", html_str)
+                if comp_match:
+                    tag = comp_match.group(1)
+                    lines.append(f"<!-- <{tag}/> -->")
+                    lines.append("")
+                    return lines
+                # Decode embedded data-uri images (e.g., matplotlib)
+                img_match = re.search(
+                    r"<img[^>]+src=['\"](data:[^'\"]+)['\"]",
+                    html_str,
+                    re.IGNORECASE,
+                )
+                if img_match:
+                    src = img_match.group(1)
+                    decoded = decode_data_uri(src)
+                    if decoded is not None:
+                        mime, bytes_ = decoded
+                        ext = mimetypes.guess_extension(mime) or ".bin"
+                        rel = save_binary_asset(
+                            bytes_,
+                            ext,
+                            cell_index=cell_index,
+                            asset_index=next_asset_index(),
+                        )
+                        lines.append(f"![]({rel})")
+                        lines.append("")
+                        return lines
+                if "<iframe" in html_str:
+                    # Keep iframes as-is
+                    # Optionally, extract first iframe
+                    iframe_match = re.search(
+                        r"<iframe[\s\S]*?</iframe>", html_str, re.IGNORECASE
+                    )
+                    if iframe_match:
+                        lines.append(iframe_match.group(0))
+                        lines.append("")
+                        return lines
+                if "<video" in html_str:
+                    # Extract <source src="data:..."> within <video> and save
+                    vsource = re.search(
+                        r"<source[^>]+src=['\"](data:[^'\"]+)['\"][^>]*>",
+                        html_str,
+                        re.IGNORECASE,
+                    )
+                    if vsource:
+                        src = vsource.group(1)
+                        decoded = decode_data_uri(src)
+                        if decoded is not None:
+                            mime, bytes_ = decoded
+                            ext = mimetypes.guess_extension(mime) or ".mp4"
+                            rel = save_binary_asset(
+                                bytes_,
+                                ext,
+                                cell_index=cell_index,
+                                asset_index=next_asset_index(),
+                            )
+                            lines.append(
+                                f'<video controls src="{rel}"></video>'
+                            )
+                            lines.append("")
+                            return lines
+                    # Try to extract data URI source and save as asset
+                    vsrc = re.search(
+                        r"<video[^>]+src=['\"](data:[^'\"]+)['\"]",
+                        html_str,
+                        re.IGNORECASE,
+                    )
+                    if vsrc:
+                        src = vsrc.group(1)
+                        decoded = decode_data_uri(src)
+                        if decoded is not None:
+                            mime, bytes_ = decoded
+                            ext = mimetypes.guess_extension(mime) or ".mp4"
+                            rel = save_binary_asset(
+                                bytes_,
+                                ext,
+                                cell_index=cell_index,
+                                asset_index=next_asset_index(),
+                            )
+                            lines.append(
+                                f'<video controls src="{rel}"></video>'
+                            )
+                            lines.append("")
+                            return lines
+                    video_match = re.search(
+                        r"<video[\s\S]*?</video>", html_str, re.IGNORECASE
+                    )
+                    if video_match:
+                        lines.append(video_match.group(0))
+                        lines.append("")
+                        return lines
+                # Fallback: strip tags, keep text
+                text_only = re.sub(r"<[^>]+>", "", html_str).strip()
+                if text_only:
+                    # Treat plain HTML text as code (not prose)
+                    lines.extend(["```", text_only, "```", ""])
+                return lines
+
+            # Vega/Altair specs and other interactive JSON bundles: comment placeholder
+            if mimetype in (
+                "application/vnd.vega.v5+json",
+                "application/vnd.vegalite.v5+json",
+                "application/vnd.jupyter.widget-view+json",
+            ):
+                # Save the spec for convenience
+                try:
+                    spec_text = (
+                        json.dumps(data, indent=2)
+                        if not isinstance(data, str)
+                        else data
+                    )
+                except Exception:
+                    spec_text = str(data)
+                rel = save_text_asset(
+                    spec_text,
+                    ".json",
+                    cell_index=cell_index,
+                    asset_index=next_asset_index(),
+                )
+                short = (
+                    "vega"
+                    if "vega" in mimetype
+                    else ("widget" if "widget" in mimetype else "json")
+                )
+                lines.append(f'<!-- <marimo-{short} src="{rel}"/> -->')
+                lines.append("")
+                return lines
+
+            # Unknown -> code fence with stringified content
+            try:
+                rendered = (
+                    json.dumps(data, indent=2)
+                    if not isinstance(data, str)
+                    else data
+                )
+            except Exception:
+                rendered = str(data)
+            if str(rendered).strip() != "":
+                lines.extend(["```", str(rendered).rstrip("\n"), "```", ""])
+            return lines
+
+        lines: list[str] = []
+        cell_order = list(app.cell_manager.cell_ids())
+        for index, cid in enumerate(cell_order):
+            # Optionally include code if cell uses mo.show_code
+            if cid in app.graph.cells:
+                code = app.graph.cells[cid].code
+                if "mo.show_code" in code:
+                    try:
+                        from marimo._output.show_code import (
+                            substitute_show_code_with_arg,
+                        )
+
+                        display_code = substitute_show_code_with_arg(code)
+                    except Exception:
+                        display_code = code
+                    lines.extend(
+                        ["```python", display_code.rstrip("\n"), "```", ""]
+                    )
+
+            # Console outputs
+            for console in session_view.get_cell_console_outputs([cid]).get(
+                cid, []
+            ):
+                if console.channel in (CellChannel.STDOUT, CellChannel.STDERR):
+                    text = str(console.data)
+                    if text.strip() != "":
+                        lines.extend(["```", text.rstrip("\n"), "```", ""])
+                elif console.channel == CellChannel.MEDIA:
+                    lines.extend(
+                        output_to_markdown(console, cell_index=index + 1)
+                    )
+
+            # Data output (skip if mo.show_code was used in cell)
+            data_output = session_view.get_cell_outputs([cid]).get(cid)
+            include_output = True
+            if (
+                cid in app.graph.cells
+                and "mo.show_code" in app.graph.cells[cid].code
+            ):
+                include_output = False
+            if include_output and data_output is not None:
+                lines.extend(
+                    output_to_markdown(data_output, cell_index=index + 1)
+                )
+
+        markdown = "\n".join(lines).strip() + ("\n" if lines else "")
+        # Return a filename derived from the notebook filename
+        return markdown, get_download_filename(filename, "md")
 
     def export_as_md(
         self,

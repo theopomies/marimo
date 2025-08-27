@@ -228,6 +228,38 @@ async def run_app_then_export_as_reactive_html(
     )
 
 
+async def run_app_then_export_as_md_output(
+    path: MarimoPath,
+    output_directory: Path,
+    cli_args: SerializedCLIArgs,
+    argv: list[str] | None,
+) -> ExportResult:
+    """Run a notebook and export its outputs as pure Markdown + assets."""
+    file_router = AppFileRouter.from_filename(path)
+    file_key = file_router.get_unique_file_key()
+    assert file_key is not None
+    file_manager = file_router.get_file_manager(file_key)
+
+    with patch_html_for_non_interactive_output():
+        (session_view, did_error) = await run_app_until_completion(
+            file_manager,
+            cli_args,
+            argv,
+        )
+
+    contents, download_filename = Exporter().export_as_md_output(
+        filename=file_manager.filename,
+        app=file_manager.app,
+        session_view=session_view,
+        output_directory=output_directory,
+    )
+    return ExportResult(
+        contents=contents,
+        download_filename=download_filename,
+        did_error=did_error,
+    )
+
+
 async def run_app_until_completion(
     file_manager: AppFileManager,
     cli_args: SerializedCLIArgs,
